@@ -24,31 +24,27 @@
 #include <unistd.h>
 #include <fcntl.h>
 #include <errno.h>
+#include <sys/stat.h>
+#include <sys/mman.h>
 #endif
 
 #include "base64.h"
 
 int read_binary_file(const char* path, unsigned char** pdata, size_t* size)
 {
-	FILE *fp = fopen(path, "rb");
-	if(!fp) return 1;
-	fseek(fp, 0, SEEK_END);
-	*size = (size_t)ftell(fp);
-	rewind(fp);
-	unsigned char *data = malloc(*size);
-	if(!data)
-	{
-		fclose(fp);
-		return 3;
-	}
-	if(fread(data, 1, *size, fp) != *size)
-	{
-		free(data);
-		fclose(fp);
-		return 2;
-	}
-	*pdata = data;
-	fclose(fp);
+    int fd = open(path, O_RDONLY);
+    if(fd < 0)
+        return 1;
+    struct stat st;
+    if(fstat(fd, &st) < 0)
+        return 1;
+    if(st.st_size <= 0)
+        return 1;
+    void *mapping = mmap(0, st.st_size, PROT_READ, MAP_SHARED, fd, 0);
+    if(mapping == MAP_FAILED)
+        return 1;
+    *pdata = (unsigned char*)mapping;
+    *size = st.st_size;
 	return 0;
 }
 
@@ -172,7 +168,7 @@ int route_serve_file(struct route *route, int fd, const char *file)
 	if(read_text_file(file, &fb, &fs))
 		return 1;
 	int keep_alive = 0;
-	heap_string hdr = build_http_header("text/html", 200, "OK", fb, fs, keep_alive);
+	heap_string hdr = build_http_header("text/html", 200, "OK", (const char*)fb, fs, keep_alive);
 	free(fb);
 	write(fd, hdr, heap_string_size(&hdr) + 1);
 	//heap_string_free(&hdr);
@@ -482,13 +478,13 @@ void serve_file(int fd, const char *path, const char *mime_type)
 	if(!read_binary_file(path, &fb, &fs))
 	{
 		int keep_alive = 0;
-		heap_string hdr = build_http_header(mime_type, 200, "OK", fb, fs, keep_alive);
+		heap_string hdr = build_http_header(mime_type, 200, "OK", (const char*)fb, fs, keep_alive);
 		int numbytes = heap_string_size(&hdr);
 		int written = 0;
 		while(1)
 		{
 			#define BUFSZ (16384)
-			int bufsz = BUFSZ;
+			int bufsz = written == 0 ? numbytes : BUFSZ; //if we haven't written anything yet, just try to send the whole file in one go
 			if(numbytes - written < BUFSZ)
 				bufsz = numbytes - written;
 			int n = write(fd, hdr + written, bufsz);
@@ -499,7 +495,7 @@ void serve_file(int fd, const char *path, const char *mime_type)
 			written += n;
 			printf("sending %d/%d bytes\n", written, numbytes);
 		}
-		free(fb);
+        munmap(fb, fs);
 	}
 }
 
