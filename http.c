@@ -293,6 +293,7 @@ void parse_http_header_method_and_route(FILE *stream, heap_string *route_path)
 #define MAX_HTTP_HEADER_LINE_LENGTH (1024)
 #define MAX_HTTP_HEADER_KEY_LENGTH (256)
 #define MAX_HTTP_HEADER_VALUE_LENGTH (256)
+#define MAX_HTTP_CONTENT_LENGTH (1000 * 1000 * 1000) //1GB
 
 typedef struct
 {
@@ -316,23 +317,27 @@ int parse_http_header(
 	
 	*kvp = hash_map_create(http_header_key_value_t);
 	char line[MAX_HTTP_HEADER_LINE_LENGTH] = {0};
+	int retval = 0;
 	do
 	{
 		if(1 == parse_http_header_line(stream, line, sizeof(line), NULL)) //don't care about overflow so NULL
 		{
 			//if we hit EOF, then the http header is longer than the bufsz we allocated for it, return HTTP 413
-			return 0;
+			retval = 0;
+			break;
 		}
 		if(line[0] == 0) //empty line end of header
 		{
-			return ftell(stream); //return end of the header position
+			retval = ftell(stream); //return end of the header position
+			break;
 		}
 		http_header_key_value_t kv;
 		parse_http_header_key_value_pair(line, kv.key, sizeof(kv.key), kv.value, sizeof(kv.value));
 		hash_map_insert(*kvp, kv.key, kv);
 		//printf("[%s] = [%s]\n", kv.key, kv.value);
 	} while(line[0] != 0);
-	return 0;
+	fclose(stream);
+	return retval;
 }
 
 void send_404(int fd)
@@ -499,6 +504,82 @@ void serve_file(int fd, const char *path, const char *mime_type)
 	}
 }
 
+#define MIN(a,b) ((a) < (b) ? (a) : (b))
+#define MAX(a,b) ((a) > (b) ? (a) : (b))
+
+static void write_buffer_to_file(const char *path, char *buffer, size_t n)
+{
+	int fd = open(path, O_WRONLY | O_CREAT | O_TRUNC | O_APPEND | O_SYNC);
+	if(fd == -1)
+		return;
+	write(fd, buffer, n);
+	close(fd);
+}
+
+void parse_multipart_formdata(FILE *stream, const char *boundary)
+{
+	//TODO
+}
+
+void parse_content(int fd, int *http_status, int content_length, struct hash_map *kvp, const char *header_data, size_t bytesread)
+{
+	if(content_length == 0)
+		return;
+
+	if(content_length > MAX_HTTP_CONTENT_LENGTH)
+	{
+		*http_status = 413;
+		return;
+	}
+	
+	const char *content_type_string = http_get_header_value(kvp, "Content-Type");
+	
+	heap_string boundary;
+	heap_string charset;
+	heap_string content_type;
+	
+	//as of now the max body length is 1GB, just read that into memory and parse it
+	char *data = malloc(content_length);
+	//copy the first bit of data in the header over
+	memcpy(data, header_data, bytesread);
+	char temp_buf[16384];
+	while(bytesread < content_length)
+	{
+		int n = recv(fd, temp_buf, sizeof(temp_buf), 0);
+		if(n == 0 || n == -1)
+		{
+			*http_status = 400;
+			break;
+		}
+		memcpy(data + bytesread, temp_buf, MIN(n, sizeof(temp_buf)));
+		bytesread += n;
+	}
+	
+	if(*content_type_string && *http_status == 200)
+	{
+		parse_content_type(content_type_string, &content_type, &charset, &boundary);
+		printf("content_type=%s,charset=%s,boundary=%s\n",content_type,charset,boundary);
+		
+		if(!strcmp(content_type, "multipart/form-data"))
+		{
+			printf("got %d bytes!! multipart/form-data\n", bytesread);
+			
+			FILE *stream = fmemopen((void*)data, bytesread, "r");
+			parse_multipart_formdata(stream, boundary);
+			fclose(stream);
+		} else
+		{
+			*http_status = 415;
+		}
+	}
+	//write_buffer_to_file("data.bin", data, bytesread);
+	free(data);
+	
+	heap_string_free(&boundary);
+	heap_string_free(&charset);
+	heap_string_free(&content_type);
+}
+
 void handle_client(int fd)
 {
 	char buf[MAX_HTTP_HEADER_LENGTH]={0};
@@ -522,29 +603,10 @@ void handle_client(int fd)
 			heap_string route_path;
 			struct hash_map *kvp;
 			int data_pos = parse_http_header(buf, sizeof(buf), &route_path, &kvp);
-			printf("data_pos=%d\n",data_pos);
-			printf("data=<%s>\n", buf + data_pos);
-			int content_length = atoi(http_get_header_value(kvp, "Content-Length"));
-			const char *content_type_string = http_get_header_value(kvp, "Content-Type");
-			
-			heap_string boundary;
-			heap_string charset;
-			heap_string content_type;
-			
-			if(*content_type_string)
-			{
-				parse_content_type(content_type_string, &content_type, &charset, &boundary);
-				printf("content_type=%s,charset=%s,boundary=%s\n",content_type,charset,boundary);
-			}
-			
-			heap_string_free(&boundary);
-			heap_string_free(&charset);
-			heap_string_free(&content_type);
-			
 			//if there's no content-length, then data_pos should just be ignored
 			if(data_pos == 0)
 			{
-				send_http_status_code(fd, 413, "Payload Too Large");
+				send_http_status_code(fd, 400, "Bad Request");
 				//send_http_status_code(fd, 418, "I'm a teapot");
 			} else
 			{
@@ -557,19 +619,41 @@ void handle_client(int fd)
 					send_http_status_code(fd, 401, "Unauthorized");
 				} else
 				{
-					if(!strcmp(route_path, "/favicon.ico"))
+					int content_length = atoi(http_get_header_value(kvp, "Content-Length"));
+					int http_status = 200;
+					parse_content(fd, &http_status, content_length, kvp, buf + data_pos, MIN(sizeof(buf) - data_pos, content_length));
+					if(http_status == 200)
 					{
-						send_404(fd);
-					} else if(!strcmp(route_path, "/test.jpg"))
-					{
-						serve_file(fd, "test.jpg", "image/jpeg");
-					} else if(!strcmp(route_path, "/test.zip"))
-					{
-						serve_file(fd, "test.zip", "application/zip");
+						if(!strcmp(route_path, "/favicon.ico"))
+						{
+							send_404(fd);
+						} else if(!strcmp(route_path, "/test.jpg"))
+						{
+							serve_file(fd, "test.jpg", "image/jpeg");
+						} else if(!strcmp(route_path, "/test.zip"))
+						{
+							serve_file(fd, "test.zip", "application/zip");
+						} else
+						{
+							const char *html = "<img src='test.jpg' style='width:100px;height:100px;'><marquee>TEST</marquee><form enctype='multipart/form-data' method='post' action='/'><input type='text' name='text'><input type='file' name='file'><input type='text' name='textfield'><input type='submit' name='submit' value='upload'></form>";
+							send_html(fd, html);
+						}
 					} else
 					{
-						const char *html = "<img src='test.jpg' style='width:100px;height:100px;'><marquee>TEST</marquee><form enctype='multipart/form-data' method='post' action='/'><input type='text' name='text'><input type='file' name='file'><input type='submit' name='submit' value='upload'></form>";
-						send_html(fd, html);
+						switch(http_status)
+						{
+							case 413:
+								send_http_status_code(fd, http_status, "Payload Too Large");
+							break;
+							
+							case 415:
+								send_http_status_code(fd, http_status, "Unsupported Media Type");
+							break;
+							
+							default:
+								send_http_status_code(fd, http_status, "Something went wrong.");
+							break;
+						}
 					}
 				}
 			}
