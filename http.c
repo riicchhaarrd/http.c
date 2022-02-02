@@ -1,3 +1,9 @@
+//compile for linux
+//gcc -g -I../rhd http.c
+
+//cross compile exe
+//x86_64-w64-mingw32-gcc http.c -I../rhd -lwsock32 -lws2_32
+
 #define memory_allocate malloc
 #define memory_deallocate free
 
@@ -10,11 +16,15 @@
 #define HASH_MAP_IMPL
 #include "hash_map.h"
 
-#define PARSE_IMPL
-#include "parse.h"
+#define STREAM_PARSE_IMPL
+#include "stream_parse.h"
 
 #include <signal.h>
 #include <time.h>
+
+#include <errno.h>
+#include <sys/stat.h>
+#include <errno.h>
 
 #ifndef _WIN32
 #include <sys/types.h>
@@ -23,11 +33,12 @@
 #include <netinet/tcp.h>
 #include <unistd.h>
 #include <fcntl.h>
-#include <errno.h>
-#include <sys/stat.h>
 #include <sys/mman.h>
 #include <dirent.h>
-#include <errno.h>
+#else
+#include <winsock2.h>
+#include <ws2tcpip.h>
+#pragma comment(lib, "ws2_32.lib")
 #endif
 
 #include "base64.h"
@@ -36,19 +47,25 @@ static int uploads_enabled = 0;
 
 int read_binary_file(const char* path, unsigned char** pdata, size_t* size)
 {
-    int fd = open(path, O_RDONLY);
-    if(fd < 0)
-        return 1;
-    struct stat st;
-    if(fstat(fd, &st) < 0)
-        return 1;
-    if(st.st_size <= 0)
-        return 1;
-    void *mapping = mmap(0, st.st_size, PROT_READ, MAP_SHARED, fd, 0);
-    if(mapping == MAP_FAILED)
-        return 1;
-    *pdata = (unsigned char*)mapping;
-    *size = st.st_size;
+	FILE *fp = fopen(path, "rb");
+	if(!fp) return 1;
+	fseek(fp, 0, SEEK_END);
+	*size = (size_t)ftell(fp);
+	rewind(fp);
+	unsigned char *data = malloc(*size);
+	if(!data)
+	{
+		fclose(fp);
+		return 3;
+	}
+	if(fread(data, 1, *size, fp) != *size)
+	{
+		free(data);
+		fclose(fp);
+		return 2;
+	}
+	*pdata = data;
+	fclose(fp);
 	return 0;
 }
 
@@ -86,11 +103,6 @@ void stop_server(int sig)
 {
 	listening = 0;
 	close(sock);
-}
-
-int set_non_blocking(int fd)
-{
-	return fcntl(fd, F_SETFL, fcntl(fd, F_GETFL, 0) | O_NONBLOCK);
 }
 
 heap_string build_http_header(const char *content_type, int status_code, const char *status_message, const char *data, size_t data_size, int keep_alive)
@@ -164,7 +176,7 @@ void parse_http_header_key_value_pair(const char *string, char *key, size_t keys
 	value[vn] = 0;
 }
 
-int parse_http_header_line(FILE *fp, char *buf, size_t bufsz, int *overflow, size_t *index)
+int parse_http_header_line(stream_t *stream, char *buf, size_t bufsz, int *overflow, size_t *index)
 {
 	size_t tmp_index = 0;
 	if(!index)
@@ -184,13 +196,13 @@ int parse_http_header_line(FILE *fp, char *buf, size_t bufsz, int *overflow, siz
 				*overflow = 1;
 			break;
 		}
-		c = fgetc(fp);
+		c = stream_get_character(stream);
 		if(c == EOF || c == '\n')
 			break;
 		if(c == '\r')
 		{
-			if((c = fgetc(fp)) != '\n')
-				ungetc(c, fp); //unget next character, whatever that may be
+			if((c = stream_get_character(stream)) != '\n')
+				stream_unget_character(stream, c); //unget next character, whatever that may be
 			else
 				break;
 		}
@@ -202,7 +214,7 @@ int parse_http_header_line(FILE *fp, char *buf, size_t bufsz, int *overflow, siz
 }
 
 //TODO: grab method e.g POST/GET
-void parse_http_header_method_and_route(FILE *stream, heap_string *route_path)
+void parse_http_header_method_and_route(stream_t *stream, heap_string *route_path)
 {
 	char request[8]; //can be max length of 7 + 1 for \0
 	parse_ident_to_buffer(stream, request, sizeof(request), NULL);
@@ -238,16 +250,21 @@ int parse_http_header(
 )
 {
 	assert(bufsz >= 8);
-	FILE *stream = fmemopen((void*)buffer, bufsz, "r");
 	
-	parse_http_header_method_and_route(stream, route_path);
+	stream_t stream = {
+		.buffer = (char*)buffer,
+		.buffer_size = bufsz,
+		.buffer_index = 0
+	};
+	
+	parse_http_header_method_and_route(&stream, route_path);
 	
 	*kvp = hash_map_create(http_header_key_value_t);
 	char line[MAX_HTTP_HEADER_LINE_LENGTH] = {0};
 	int retval = 0;
 	do
 	{
-		if(1 == parse_http_header_line(stream, line, sizeof(line), NULL, NULL)) //don't care about overflow so NULL
+		if(1 == parse_http_header_line(&stream, line, sizeof(line), NULL, NULL)) //don't care about overflow so NULL
 		{
 			//if we hit EOF, then the http header is longer than the bufsz we allocated for it, return HTTP 413
 			retval = 0;
@@ -255,7 +272,7 @@ int parse_http_header(
 		}
 		if(line[0] == 0) //empty line end of header
 		{
-			retval = ftell(stream); //return end of the header position
+			retval = stream_tell(&stream); //return end of the header position
 			break;
 		}
 		http_header_key_value_t kv;
@@ -263,7 +280,6 @@ int parse_http_header(
 		hash_map_insert(*kvp, kv.key, kv);
 		//printf("[%s] = [%s]\n", kv.key, kv.value);
 	} while(line[0] != 0);
-	fclose(stream);
 	return retval;
 }
 
@@ -427,7 +443,7 @@ void serve_file(int fd, const char *path, const char *mime_type)
 			written += n;
 			//printf("sending %d/%d bytes\n", written, numbytes);
 		}
-        munmap(fb, fs);
+        free(fb);
 	}
 }
 
@@ -438,20 +454,20 @@ void serve_file(int fd, const char *path, const char *mime_type)
 
 static void write_buffer_to_file(const char *path, char *buffer, size_t n)
 {
-	int fd = open(path, O_WRONLY | O_CREAT | O_TRUNC | O_APPEND | O_SYNC, 0666);
-	if(fd == -1)
+	FILE *fp = fopen(path, "wb");
+	if(!fp)
 		return;
-	write(fd, buffer, n);
-	close(fd);
+	fwrite(buffer, 1, n, fp);
+	fclose(fp);
 }
 
-int parse_seek_string(FILE *stream, const char *string)
+int parse_seek_string(stream_t *stream, const char *string)
 {
 	int i = 0;
 	int n = strlen(string);
 	while(1)
 	{
-		int c = fgetc(stream);
+		int c = stream_get_character(stream);
 		if(c == EOF)
 			break;
 		if(string[i] == c)
@@ -465,11 +481,11 @@ int parse_seek_string(FILE *stream, const char *string)
 	return 1;
 }
 
-int parse_seek_character(FILE *stream, int ch)
+int parse_seek_character(stream_t *stream, int ch)
 {
 	while(1)
 	{
-		int c = fgetc(stream);
+		int c = stream_get_character(stream);
 		if(c == EOF)
 			break;
 		if(c == ch)
@@ -478,11 +494,11 @@ int parse_seek_character(FILE *stream, int ch)
 	return 1;
 }
 
-int match_boundary(FILE *stream, const char *boundary)
+int match_boundary(stream_t *stream, const char *boundary)
 {
 	for(int i = 0; boundary[i]; ++i)
 	{
-		int c = fgetc(stream);
+		int c = stream_get_character(stream);
 		if(c == EOF)
 			return -1;
 		if(c != boundary[i])
@@ -500,87 +516,6 @@ typedef struct
 	int is_file;
 	int data_index_start, data_index_end;
 } form_data_t;
-
-typedef struct
-{
-	char *buffer;
-	size_t buffer_size;
-	size_t buffer_index;
-} stream_t;
-
-int stream_read_character(stream_t *stream)
-{
-	if(stream->buffer_index + 1 >= stream->buffer_size)
-		return -1;
-	return stream->buffer[stream->buffer_index++];
-}
-
-int stream_seek_character(stream_t *stream, int character)
-{
-	int ch;
-	while(1)
-	{
-		ch = stream_read_character(stream);
-		if(ch == -1 || ch == character)
-			break;
-	}
-	return ch == character ? 0 : 1;
-}
-
-void stream_skip_character(stream_t *stream, int character)
-{
-	while(1)
-	{
-		int ch = stream_read_character(stream);
-		if(ch == -1 || ch == character)
-			break;
-	}
-}
-
-int stream_read_till_character_match(stream_t *stream, char *out, size_t outsize, size_t *outcount, int character)
-{
-	size_t tmp_count;
-	if(!outcount)
-		outcount = &tmp_count;
-	*outcount = 0;
-	int ch;
-	while(1)
-	{
-		ch = stream_read_character(stream);
-		if(ch == -1 || ch == character)
-			break;
-		if(*outcount + 1 >= outsize)
-			return 1;
-		out[*outcount] = ch;
-		*outcount += 1;
-	}
-	out[*outcount] = 0;
-	return ch == character ? 0 : 1;
-}
-
-int stream_seek_string(stream_t *stream, const char *string)
-{
-	int n = 0;
-	int string_length = strlen(string);
-	while(1)
-	{
-		int ch = stream_read_character(stream);
-		if(ch == -1)
-			break;
-		
-		if(n >= string_length)
-			break; //shouldn't happen really.. like ever
-		
-		if(string[n] == ch)
-		{
-			++n;
-			if(n == string_length)
-				return 0;
-		} else
-			n = 0;
-	}
-	return 1;
-}
 
 int parse_multipart_formdata_header_line(const char *buffer_string, form_data_t *fd)
 {
@@ -625,21 +560,21 @@ int parse_multipart_formdata_header_line(const char *buffer_string, form_data_t 
 	return 0;
 }
 
-int parse_match_and_consume_buffer(FILE *stream, const char *buffer, size_t n)
+int parse_match_and_consume_buffer(stream_t *stream, const char *buffer, size_t n)
 {
-	int pos = ftell(stream);
+	int pos = stream_tell(stream);
 	for(int i = 0; i < n; ++i)
 	{
-		if(fgetc(stream) != buffer[i])
+		if(stream_get_character(stream) != buffer[i])
 		{
-			fseek(stream, pos, SEEK_SET); //restore position
+			stream_seek(stream, pos, SEEK_SET); //restore position
 			return 1;
 		}
 	}
 	return 0;
 }
 
-int parse_multipart_formdata_header(FILE *stream, const char *boundary, int boundary_length, form_data_t *fd, int *last_boundary)
+int parse_multipart_formdata_header(stream_t *stream, const char *boundary, int boundary_length, form_data_t *fd, int *last_boundary)
 {
 	char line[MAX_HTTP_HEADER_LINE_LENGTH] = {0};
 	while(1)
@@ -659,14 +594,14 @@ int parse_multipart_formdata_header(FILE *stream, const char *boundary, int boun
 			return 1;
 		}
 	}
-	fd->data_index_start = ftell(stream);
+	fd->data_index_start = stream_tell(stream);
 	while(1)
 	{
 		//scan till next \r\n
-		int ch = fgetc(stream);
+		int ch = stream_get_character(stream);
 		if(ch == EOF)
 			return 1;
-		int pos = ftell(stream);
+		int pos = stream_tell(stream);
 		if(ch == '\r')
 		{
 			if(!parse_match_and_consume_buffer(stream, "\n--", 3)
@@ -687,7 +622,7 @@ int parse_multipart_formdata_header(FILE *stream, const char *boundary, int boun
 	return 0;
 }
 
-int parse_multipart_formdata(FILE *stream, const char *content_type_boundary, form_data_t *form_data, size_t max_form_data_entries, size_t *num_form_data_entries)
+int parse_multipart_formdata(stream_t *stream, const char *content_type_boundary, form_data_t *form_data, size_t max_form_data_entries, size_t *num_form_data_entries)
 {
 	if(parse_seek_character(stream, '-'))
 		return 1;
@@ -756,9 +691,14 @@ void parse_content(int fd, int *http_status, int content_length, struct hash_map
 			printf("got %lu bytes!! multipart/form-data\n", bytesread);
 			
 			form_data_t form_data[16]; //TODO: increase max form_data
-			FILE *stream = fmemopen((void*)data, bytesread, "r");
+			stream_t stream = {
+				.buffer = (char*)data,
+				.buffer_size = bytesread,
+				.buffer_index = 0
+			};
+			
 			size_t num_entries = 0;
-			parse_multipart_formdata(stream, boundary, form_data, COUNT_OF(form_data), &num_entries);
+			parse_multipart_formdata(&stream, boundary, form_data, COUNT_OF(form_data), &num_entries);
 			if(uploads_enabled)
 			{
 				for(int i = 0; i < num_entries; ++i)
@@ -772,7 +712,6 @@ void parse_content(int fd, int *http_status, int content_length, struct hash_map
 					write_buffer_to_file(filename, data + form_data[i].data_index_start, form_data[i].data_index_end - form_data[i].data_index_start);
 				}
 			}
-			fclose(stream);
 		} else
 		{
 			*http_status = 415;
@@ -794,16 +733,14 @@ void handle_client(int fd)
 	{
 		//disconnected
 		LOG_MESSAGE("erasing node\n");
-		//linked_list_erase_node(clients, node);
 	} else if(n == -1)
 	{
-		if(errno != EWOULDBLOCK)
-			perror("recv");
+		//if(errno != EWOULDBLOCK)
+			//perror("recv");
 	} else
 	{
 		LOG_MESSAGE("%d bytes\n", n);
 		//printf("%s\n", buf);
-		FILE *stream = NULL;
 		if(n >= 8)
 		{
 			heap_string route_path;
@@ -876,12 +813,17 @@ void handle_client(int fd)
 
 int main(void)
 {
-	DIR *dir = opendir("uploads");
-	if(dir)
+	struct stat st;
+	if(stat("uploads", &st) == 0 && st.st_mode & S_IFDIR)
 	{
 		uploads_enabled = 1;
-		closedir(dir);
 	}
+	#ifdef _WIN32
+	static WSADATA wsa_data;
+	if(WSAStartup(MAKEWORD(2,0), &wsa_data) != 0)
+		return 0;
+	#endif
+	
 	struct sockaddr_in sa;
 	memset(&sa, 0, sizeof(sa));
 	
@@ -893,10 +835,8 @@ int main(void)
 	sock = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
 	if(sock == -1)
 		perror("socket");
-	setsockopt(sock, SOL_SOCKET, SO_REUSEADDR, &(int){1}, sizeof(int));
-	
-	//if(set_non_blocking(sock) == -1)
-		//perror("failed to set non-blocking");
+	int const_value_1 = 1;
+	setsockopt(sock, SOL_SOCKET, SO_REUSEADDR, (char*)&const_value_1, sizeof(int));
 	
 	if(bind(sock, (struct sockaddr*)&sa, sizeof(sa)) == -1)
 		perror("bind");
@@ -906,6 +846,7 @@ int main(void)
 	signal(SIGINT, stop_server);
 	while(listening)
 	{
+		/*
 		fd_set set;
 		struct timeval timeout;
 		int rv;
@@ -926,6 +867,7 @@ int main(void)
 			LOG_MESSAGE("timeout...\n");
 			goto repeat;
 		}
+		*/
 		
 		struct sockaddr_in client_sa;
 		int client_fd = accept(sock, (struct sockaddr*)&client_sa, &(socklen_t){sizeof(client_sa)});
@@ -938,8 +880,13 @@ int main(void)
 		} else
 		{
 			handle_client(client_fd);
+			#ifdef _WIN32
+			shutdown(client_fd, SD_SEND);
+			closesocket(client_fd);
+			#else
 			shutdown(client_fd, SHUT_WR);
 			close(client_fd);
+			#endif
 		}
 	}
 	return 0;
