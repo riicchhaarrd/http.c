@@ -197,7 +197,7 @@ int parse_http_header_line(stream_t *stream, char *buf, size_t bufsz, int *overf
 			break;
 		}
 		c = stream_get_character(stream);
-		if(c == EOF || c == '\n')
+		if(c == STREAM_EOF || c == '\n')
 			break;
 		if(c == '\r')
 		{
@@ -210,7 +210,7 @@ int parse_http_header_line(stream_t *stream, char *buf, size_t bufsz, int *overf
 		*index += 1;
 	}
 	buf[*index] = '\0';
-	return c == EOF ? 1 : 0;
+	return c == STREAM_EOF ? 1 : 0;
 }
 
 //TODO: grab method e.g POST/GET
@@ -266,7 +266,7 @@ int parse_http_header(
 	{
 		if(1 == parse_http_header_line(&stream, line, sizeof(line), NULL, NULL)) //don't care about overflow so NULL
 		{
-			//if we hit EOF, then the http header is longer than the bufsz we allocated for it, return HTTP 413
+			//if we hit STREAM_EOF, then the http header is longer than the bufsz we allocated for it, return HTTP 413
 			retval = 0;
 			break;
 		}
@@ -454,6 +454,8 @@ void serve_file(int fd, const char *path, const char *mime_type)
 
 static void write_buffer_to_file(const char *path, char *buffer, size_t n)
 {
+	if(n == 0)
+		return;
 	FILE *fp = fopen(path, "wb");
 	if(!fp)
 		return;
@@ -468,7 +470,7 @@ int parse_seek_string(stream_t *stream, const char *string)
 	while(1)
 	{
 		int c = stream_get_character(stream);
-		if(c == EOF)
+		if(c == STREAM_EOF)
 			break;
 		if(string[i] == c)
 		{
@@ -486,7 +488,7 @@ int parse_seek_character(stream_t *stream, int ch)
 	while(1)
 	{
 		int c = stream_get_character(stream);
-		if(c == EOF)
+		if(c == STREAM_EOF)
 			break;
 		if(c == ch)
 			return 0;
@@ -499,8 +501,8 @@ int match_boundary(stream_t *stream, const char *boundary)
 	for(int i = 0; boundary[i]; ++i)
 	{
 		int c = stream_get_character(stream);
-		if(c == EOF)
-			return -1;
+		if(c == STREAM_EOF)
+			return STREAM_EOF;
 		if(c != boundary[i])
 			return 1;
 	}
@@ -599,9 +601,12 @@ int parse_multipart_formdata_header(stream_t *stream, const char *boundary, int 
 	{
 		//scan till next \r\n
 		int ch = stream_get_character(stream);
-		if(ch == EOF)
-			return 1;
 		int pos = stream_tell(stream);
+		if(ch == STREAM_EOF)
+		{
+			fd->data_index_end = pos - 1;
+			return 1;
+		}
 		if(ch == '\r')
 		{
 			if(!parse_match_and_consume_buffer(stream, "\n--", 3)
@@ -630,6 +635,7 @@ int parse_multipart_formdata(stream_t *stream, const char *content_type_boundary
 		return 1;
 	*num_form_data_entries = 0;
 	form_data_t *fd = &form_data[*num_form_data_entries];
+	*num_form_data_entries += 1;
 	memset(fd, 0, sizeof(form_data_t));
 	int last_boundary = 0;
 	int content_type_boundary_length = strlen(content_type_boundary);
@@ -649,7 +655,7 @@ int parse_multipart_formdata(stream_t *stream, const char *content_type_boundary
 
 void parse_content(int fd, int *http_status, int content_length, struct hash_map *kvp, const char *header_data, size_t bytesread)
 {
-	if(content_length == 0)
+	if(content_length <= 0)
 		return;
 
 	if(content_length > MAX_HTTP_CONTENT_LENGTH)
@@ -664,6 +670,8 @@ void parse_content(int fd, int *http_status, int content_length, struct hash_map
 	heap_string charset;
 	heap_string content_type;
 	
+	printf("content_length=%d\n",content_length);
+	assert(bytesread <= content_length);
 	//as of now the max body length is 1GB, just read that into memory and parse it
 	char *data = malloc(content_length);
 	//copy the first bit of data in the header over
@@ -703,13 +711,16 @@ void parse_content(int fd, int *http_status, int content_length, struct hash_map
 			{
 				for(int i = 0; i < num_entries; ++i)
 				{
+					form_data_t *fd = &form_data[i];
+					printf("fd name = %s, is_file=%d, filename=%s,content_type=%s,data_size=%d,start=%d,end=%d\n",fd->name,fd->is_file,fd->filename,fd->content_type,fd->data_index_end - fd->data_index_start,fd->data_index_start,fd->data_index_end);
 					if(!form_data[i].is_file)
 						continue;
 					char filename[512];
 					//TODO: FIX this is unsafe...
 					snprintf(filename, sizeof(filename), "uploads/%s", form_data[i].filename);
-					printf("writing %s\n", filename);
-					write_buffer_to_file(filename, data + form_data[i].data_index_start, form_data[i].data_index_end - form_data[i].data_index_start);
+					printf("writing %s, %d bytes\n", filename, form_data[i].data_index_end - form_data[i].data_index_start);
+					if(form_data[i].data_index_end > form_data[i].data_index_start)
+						write_buffer_to_file(filename, data + form_data[i].data_index_start, form_data[i].data_index_end - form_data[i].data_index_start);
 				}
 			}
 		} else

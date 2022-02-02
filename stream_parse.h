@@ -44,10 +44,12 @@ int fpeekc(FILE *fp)
     return c;
 }
 
+#define STREAM_EOF (0xffff)
+
 int stream_get_character(stream_t *stream)
 {
 	if(stream->buffer_index + 1 >= stream->buffer_size)
-		return EOF;
+		return STREAM_EOF;
 	return stream->buffer[stream->buffer_index++];
 }
 
@@ -57,7 +59,7 @@ int stream_seek_character(stream_t *stream, int character)
 	while(1)
 	{
 		ch = stream_get_character(stream);
-		if(ch == EOF || ch == character)
+		if(ch == STREAM_EOF || ch == character)
 			break;
 	}
 	return ch == character ? 0 : 1;
@@ -68,7 +70,7 @@ void stream_skip_character(stream_t *stream, int character)
 	while(1)
 	{
 		int ch = stream_get_character(stream);
-		if(ch == EOF || ch == character)
+		if(ch == STREAM_EOF || ch == character)
 			break;
 	}
 }
@@ -83,7 +85,7 @@ int stream_read_till_character_match(stream_t *stream, char *out, size_t outsize
 	while(1)
 	{
 		ch = stream_get_character(stream);
-		if(ch == EOF || ch == character)
+		if(ch == STREAM_EOF || ch == character)
 			break;
 		if(*outcount + 1 >= outsize)
 			return 1;
@@ -101,7 +103,7 @@ int stream_seek_string(stream_t *stream, const char *string)
 	while(1)
 	{
 		int ch = stream_get_character(stream);
-		if(ch == EOF)
+		if(ch == STREAM_EOF)
 			break;
 		
 		if(n >= string_length)
@@ -131,7 +133,7 @@ void stream_seek(stream_t *stream, int pos, int unused)
 int stream_peek_character(stream_t *stream)
 {
 	if(stream->buffer_index >= stream->buffer_size)
-		return EOF;
+		return STREAM_EOF;
 	return stream->buffer[stream->buffer_index];
 }
 
@@ -146,7 +148,7 @@ void parse_whitespace(stream_t *stream)
 	while(1)
 	{
 		int pk = stream_peek_character(stream);
-		if(pk == EOF)
+		if(pk == STREAM_EOF)
 			return;
 		if(pk != ' ' && pk != '\t')
 			return;
@@ -160,7 +162,7 @@ void parse_skip_line(stream_t *stream)
 	do
 	{
 		c = stream_get_character(stream);
-	} while(c != EOF && c != '\n');
+	} while(c != STREAM_EOF && c != '\n');
 }
 
 int parse_float(stream_t *stream, float* out)
@@ -174,10 +176,10 @@ int parse_float(stream_t *stream, float* out)
 			return 1;
 		c = stream_get_character(stream);
 		string[stringindex++ % sizeof(string)] = c;
-	} while(c != EOF && ( c == 'e' || isdigit(c) || c == '-' || c == '.' ));
+	} while(c != STREAM_EOF && ( c == 'e' || isdigit(c) || c == '-' || c == '.' ));
 	*out = (float)atof(string);
 	stream_unget_character(stream, c); //we've parsed 1 too many
-	return c == EOF ? 1 : 0;
+	return c == STREAM_EOF ? 1 : 0;
 }
 
 int parse_float3(stream_t *stream, float *v)
@@ -212,7 +214,7 @@ int parse_ident_to_buffer(stream_t *stream, char *buf, size_t bufsz, int *overfl
 			break;
 		}
 		c = stream_get_character(stream);
-		if(c == EOF || isspace(c))
+		if(c == STREAM_EOF || isspace(c))
 		{
 			stream_unget_character(stream, c); //unget space
 			break;
@@ -220,7 +222,7 @@ int parse_ident_to_buffer(stream_t *stream, char *buf, size_t bufsz, int *overfl
 		buf[index++] = c;
 	}
 	buf[index] = '\0';
-	return c == EOF ? 1 : 0;
+	return c == STREAM_EOF ? 1 : 0;
 }
 
 /* don't forget to free ident! */
@@ -232,16 +234,16 @@ int parse_ident(stream_t *stream, heap_string *ident)
 	for(;;)
 	{
 		c = stream_get_character(stream);
-		if(c == EOF || isspace(c))
+		if(c == STREAM_EOF || isspace(c))
 		{
 			stream_unget_character(stream, c); //unget space
 			break;
 		}
 		heap_string_push(ident, c);
 	}
-	if(c == EOF)
+	if(c == STREAM_EOF)
 		heap_string_free(ident);
-	return c == EOF ? 1 : 0;
+	return c == STREAM_EOF ? 1 : 0;
 }
 
 int parse_character(stream_t *stream, int ch)
