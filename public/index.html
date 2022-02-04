@@ -1,0 +1,19 @@
+<html>
+<head>
+<title>http.c</title>
+<link rel="stylesheet" href="style.css">
+</head>
+<body>
+<img src='test.jpg'>
+<h2>Test page</h2>
+<hr>
+<p>Enjoy this embedded YouTube video.</p>
+<iframe width="560" height="315" src="https://www.youtube.com/embed/W29zEuZVaxs" title="YouTube video player" frameborder="0" allow="accelerometer; autoplay; clipboard-write; encrypted-media; gyroscope; picture-in-picture" allowfullscreen></iframe>
+<hr>
+<p>Uploading files works only if there is a folder named 'uploads' in the folder where the executable resides.</p>
+<form enctype='multipart/form-data' method='post' action='/'>
+<input type='file' name='file'>
+<input type='submit' name='submit' value='upload'>
+</form>
+</body>
+</html>

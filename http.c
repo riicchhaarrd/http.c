@@ -94,7 +94,7 @@ int read_text_file(const char* path, unsigned char** pdata, size_t* size)
 	return 0;
 }
 
-#define LOG_MESSAGE(...)
+#define LOG_MESSAGE(...) 
 
 volatile int listening = 1;
 volatile int sock = 0;
@@ -128,7 +128,7 @@ heap_string build_http_header(const char *content_type, int status_code, const c
 		heap_string_appendf(&header, "Cache-control: no-cache\r\n");
 		heap_string_appendf(&header, "Pragma: no-cache\r\n");
 	}
-	heap_string_appendf(&header, "Accept-Ranges: bytes\r\n");
+	//heap_string_appendf(&header, "Accept-Ranges: bytes\r\n");
 	if(!keep_alive)
 	{
 		heap_string_appendf(&header, "Connection: close\r\n");
@@ -409,7 +409,7 @@ int http_is_client_authorized(struct hash_map *kvp)
 		char decoded[512];
 		base64_decode(decoded, sizeof(decoded), encoded);
 		//printf("decoded=%s\n",decoded);
-		if(!strcmp(decoded, "test:1234")) //if user:pass doesn't match
+		if(!strcmp(decoded, "user:dimash")) //if user:pass doesn't match
 		{
 			return 0;
 		}
@@ -653,6 +653,44 @@ int parse_multipart_formdata(stream_t *stream, const char *content_type_boundary
 	return 0;
 }
 
+
+int is_valid_path_character(int ch)
+{
+	if(ch >= 'a' && ch <= 'z')
+		return 1;
+	if(ch >= 'A' && ch <= 'Z')
+		return 1;
+	if(ch >= '0' && ch <= '9')
+		return 1;
+	if(ch == ' ' || ch == '.')
+		return 1;
+	return 0;
+}
+
+int is_valid_path(const char *original_path)
+{	
+	if(!original_path)
+		return 0;
+	
+	//trim the path
+	const char *path = original_path;
+	while(*path && isspace(*path) == ' ')
+		++path;
+	
+	if(path[0] == 0)
+		return 0;
+	if(path[0] == '.')
+		return 0;
+	for(int i = 0; path[i]; ++i)
+	{
+		if(!is_valid_path_character(path[i]))
+			return 0;
+		if(path[i] == '.' && path[i + 1] == '.')
+			return 0;
+	}
+	return 1;
+}
+
 void parse_content(int fd, int *http_status, int content_length, struct hash_map *kvp, const char *header_data, size_t bytesread)
 {
 	if(content_length <= 0)
@@ -670,7 +708,7 @@ void parse_content(int fd, int *http_status, int content_length, struct hash_map
 	heap_string charset;
 	heap_string content_type;
 	
-	printf("content_length=%d\n",content_length);
+	printf("content_length=%d,bytesread=%ld\n",content_length,bytesread);
 	assert(bytesread <= content_length);
 	//as of now the max body length is 1GB, just read that into memory and parse it
 	char *data = malloc(content_length);
@@ -682,6 +720,13 @@ void parse_content(int fd, int *http_status, int content_length, struct hash_map
 		int n = recv(fd, temp_buf, sizeof(temp_buf), 0);
 		if(n == 0 || n == -1)
 		{
+			*http_status = 400;
+			break;
+		}
+		int space_left = content_length - bytesread;
+		if(space_left - n < 0)
+		{
+			printf("no space left... error n=%d,space_left=%d\n", n, space_left);
 			*http_status = 400;
 			break;
 		}
@@ -736,6 +781,37 @@ void parse_content(int fd, int *http_status, int content_length, struct hash_map
 	heap_string_free(&content_type);
 }
 
+const char *get_mime_for_filename(const char *filename)
+{
+	const char *p = filename;
+	while(*p)
+	{
+		if(*p == '.')
+			break;
+		p++;
+	}
+	
+	if(!strcmp(p, ".html"))
+		return "text/html";
+	else if(!strcmp(p, ".txt"))
+		return "text/plain";
+	else if(!strcmp(p, ".jpg") || !strcmp(p, ".jpeg"))
+		return "image/jpeg";
+	else if(!strcmp(p, ".png"))
+		return "image/png";
+	else if(!strcmp(p, ".gif"))
+		return "image/gif";
+	else if(!strcmp(p, ".bmp"))
+		return "image/bmp";
+	else if(!strcmp(p, ".mp3"))
+		return "audio/mpeg";
+	else if(!strcmp(p, ".js"))
+		return "application/javascript";
+	else if(!strcmp(p, ".css"))
+		return "text/css";
+	return "application/octet-stream";
+}
+
 void handle_client(int fd)
 {
 	char buf[MAX_HTTP_HEADER_LENGTH]={0};
@@ -751,7 +827,7 @@ void handle_client(int fd)
 	} else
 	{
 		LOG_MESSAGE("%d bytes\n", n);
-		//printf("%s\n", buf);
+		printf("%s\n", buf);
 		if(n >= 8)
 		{
 			heap_string route_path;
@@ -770,7 +846,8 @@ void handle_client(int fd)
 					http_response_authenticate(fd, "Test realm");
 				} else if(auth_result == 2)
 				{
-					send_http_status_code(fd, 401, "Unauthorized");
+					http_response_authenticate(fd, "Test realm");
+					//send_http_status_code(fd, 401, "Unauthorized");
 				} else
 				{
 					int content_length = atoi(http_get_header_value(kvp, "Content-Length"));
@@ -778,16 +855,21 @@ void handle_client(int fd)
 					parse_content(fd, &http_status, content_length, kvp, buf + data_pos, MIN(sizeof(buf) - data_pos, content_length));
 					if(http_status == 200)
 					{
-						if(!strcmp(route_path, "/favicon.ico"))
+						if(!is_valid_path(route_path + 1))
 						{
-							send_404(fd);
-						} else if(!strcmp(route_path, "/test.jpg"))
-						{
-							serve_file(fd, "test.jpg", "image/jpeg");
+							send_http_status_code(fd, 400, "Bad Request");
 						} else
 						{
-							const char *html = "<img src='test.jpg'><marquee>TEST</marquee><form enctype='multipart/form-data' method='post' action='/'><input type='text' name='text'><input type='file' name='file'><input type='text' name='textfield'><textarea name='textarea'></textarea><input type='submit' name='submit' value='upload'></form>";
-							send_html(fd, html);
+							char fullpath[512]={0};
+							snprintf(fullpath, sizeof(fullpath), "public/%s", route_path + 1);
+							struct stat st;
+							if(0 == stat(fullpath, &st))
+							{
+								serve_file(fd, fullpath, get_mime_for_filename(route_path + 1));
+							} else
+							{
+								send_404(fd);
+							}
 						}
 					} else
 					{
@@ -820,6 +902,14 @@ void handle_client(int fd)
 		} else
 			send_404(fd);
 	}
+	#ifdef _WIN32
+	shutdown(fd, SD_SEND);
+	closesocket(fd);
+	#else
+	shutdown(fd, SHUT_WR);
+	close(fd);
+	#endif
+	exit(0);
 }
 
 int main(void)
@@ -890,14 +980,9 @@ int main(void)
 			}
 		} else
 		{
-			handle_client(client_fd);
-			#ifdef _WIN32
-			shutdown(client_fd, SD_SEND);
-			closesocket(client_fd);
-			#else
-			shutdown(client_fd, SHUT_WR);
-			close(client_fd);
-			#endif
+			int f = fork();
+			if(f != 0)
+				handle_client(client_fd);
 		}
 	}
 	return 0;
